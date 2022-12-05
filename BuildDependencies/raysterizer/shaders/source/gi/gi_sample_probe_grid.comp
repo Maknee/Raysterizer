@@ -1,0 +1,111 @@
+#version 460
+
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_GOOGLE_include_directive : require
+
+#include "raysterizer/shaders/source/other/common.glsl"
+#include "raysterizer/shaders/source/gi/gi_common.glsl"
+
+// ------------------------------------------------------------------
+// DEFINES ----------------------------------------------------------
+// ------------------------------------------------------------------
+
+#define NUM_THREADS_X 32
+#define NUM_THREADS_Y 32
+
+// ------------------------------------------------------------------
+// INPUTS -----------------------------------------------------------
+// ------------------------------------------------------------------
+
+layout(local_size_x = NUM_THREADS_X, local_size_y = NUM_THREADS_Y, local_size_z = 1) in;
+
+// ------------------------------------------------------------------
+// DESCRIPTOR SETS --------------------------------------------------
+// ------------------------------------------------------------------
+
+layout(set = 0, binding = 0, rgba16f) uniform image2D i_Output;
+
+layout(set = 1, binding = 0) uniform sampler2D s_Irradiance;
+layout(set = 1, binding = 1) uniform sampler2D s_Depth;
+layout(set = 1, binding = 2, scalar) uniform DDGIUBO
+{
+    DDGIUniforms ddgi;
+};
+
+// Current G-buffer DS
+layout(set = 2, binding = 0) uniform sampler2D s_GBuffer1; // RGB: Albedo, A: Metallic
+layout(set = 2, binding = 1) uniform sampler2D s_GBuffer2; // RG: Normal, BA: Motion Vector
+layout(set = 2, binding = 2) uniform sampler2D s_GBuffer3; // R: Roughness, G: Curvature, B: Mesh ID, A: Linear Z
+layout(set = 2, binding = 3) uniform sampler2D s_GBufferDepth;
+
+layout(set = 3, binding = 0) uniform PerFrameUBO
+{
+    mat4  view_inverse;
+    mat4  proj_inverse;
+    mat4  view_proj_inverse;
+    mat4  prev_view_proj;
+    mat4  view_proj;
+    vec4  cam_pos;
+    vec4  near_far;
+    vec4  current_prev_jitter;
+    Light light;
+}
+u_GlobalUBO;
+
+// ------------------------------------------------------------------
+// PUSH CONSTANTS ---------------------------------------------------
+// ------------------------------------------------------------------
+
+layout(push_constant) uniform PushConstants
+{
+    int   g_buffer_mip;
+    float gi_intensity;
+}
+u_PushConstants;
+
+// ------------------------------------------------------------------
+// CONSTANTS --------------------------------------------------------
+// ------------------------------------------------------------------
+
+const float FLT_EPS = 0.00000001;
+
+// ------------------------------------------------------------------
+// MAIN -------------------------------------------------------------
+// ------------------------------------------------------------------
+
+void main()
+{
+    const ivec2 size          = textureSize(s_GBuffer1, u_PushConstants.g_buffer_mip);
+    const vec2  texel_size    = vec2(1.0f) / vec2(size);
+    const ivec2 current_coord = ivec2(gl_GlobalInvocationID.xy);
+    const vec2  pixel_center  = vec2(current_coord) + vec2(0.5);
+    const vec2  tex_coord     = pixel_center / vec2(size);
+
+    float depth = texelFetch(s_GBufferDepth, current_coord, u_PushConstants.g_buffer_mip).r;
+
+    if (depth == 1.0f)
+    {
+        imageStore(i_Output, current_coord, vec4(0.0f));
+        return;
+    }
+
+    const vec3 P  = world_position_from_depth(tex_coord, depth, u_GlobalUBO.view_proj_inverse);
+    const vec3 N  = octohedral_to_direction(texelFetch(s_GBuffer2, current_coord, u_PushConstants.g_buffer_mip).rg);
+    vec3 Wo = normalize(u_GlobalUBO.cam_pos.xyz - P);
+
+    vec4 origin = u_GlobalUBO.view_proj_inverse * vec4(0.0, 0.0, u_GlobalUBO.near_far.x, 1);
+    vec4 target = u_GlobalUBO.view_proj_inverse * vec4(tex_coord.x, tex_coord.y, u_GlobalUBO.near_far.y, 1);
+    origin.xyz /= origin.w;
+    origin.w = 1.0f / origin.w;
+    target.xyz /= target.w;
+    target.w = 1.0f / target.w;
+    vec4 direction = normalize(target - origin);
+    Wo = direction.xyz;
+
+    vec3 irradiance = u_PushConstants.gi_intensity * sample_irradiance(ddgi, P, N, Wo, s_Irradiance, s_Depth);
+
+    // Store
+    imageStore(i_Output, current_coord, vec4(irradiance, 1.0f));
+}
+
+// ------------------------------------------------------------------

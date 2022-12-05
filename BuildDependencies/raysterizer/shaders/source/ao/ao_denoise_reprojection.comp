@@ -1,0 +1,262 @@
+#version 450
+
+#extension GL_GOOGLE_include_directive : require
+
+#include "raysterizer/shaders/source/other/common.glsl"
+#define REPROJECTION_SINGLE_COLOR_CHANNEL
+#include "raysterizer/shaders/source/other/reprojection.glsl"
+
+// ------------------------------------------------------------------
+// DEFINES ----------------------------------------------------------
+// ------------------------------------------------------------------
+
+#define NUM_THREADS_X 8
+#define NUM_THREADS_Y 8
+#define RAY_MASK_SIZE_X 8
+#define RAY_MASK_SIZE_Y 4
+
+// ------------------------------------------------------------------
+// INPUTS -----------------------------------------------------------
+// ------------------------------------------------------------------
+
+layout(local_size_x = NUM_THREADS_X, local_size_y = NUM_THREADS_Y, local_size_z = 1) in;
+
+// ------------------------------------------------------------------
+// DESCRIPTOR SETS --------------------------------------------------
+// ------------------------------------------------------------------
+
+// Current Reprojection Write DS
+layout(set = 0, binding = 0, r16f) uniform writeonly image2D i_Output;
+layout(set = 0, binding = 1, r16f) uniform writeonly image2D i_HistoryLength;
+
+// Current G-buffer DS
+layout(set = 1, binding = 0) uniform sampler2D s_GBuffer1; // RGB: Albedo, A: Metallic
+layout(set = 1, binding = 1) uniform sampler2D s_GBuffer2; // RG: Normal, BA: Motion Vector
+layout(set = 1, binding = 2) uniform sampler2D s_GBuffer3; // R: Roughness, G: Curvature, B: Mesh ID, A: Linear Z
+layout(set = 1, binding = 3) uniform sampler2D s_GBufferDepth;
+
+// Previous G-Buffer DS
+layout(set = 2, binding = 0) uniform sampler2D s_PrevGBuffer1; // RGB: Albedo, A: Metallic
+layout(set = 2, binding = 1) uniform sampler2D s_PrevGBuffer2; // RG: Normal, BA: Motion Vector
+layout(set = 2, binding = 2) uniform sampler2D s_PrevGBuffer3; // R: Roughness, G: Curvature, B: Mesh ID, A: Linear Z
+layout(set = 2, binding = 3) uniform sampler2D s_PrevGBufferDepth;
+
+layout(set = 3, binding = 0) uniform usampler2D s_Input;
+
+// Previous Reprojection Read DS
+layout(set = 4, binding = 0) uniform sampler2D s_PrevAO;
+
+layout(set = 5, binding = 1) uniform sampler2D s_PrevHistoryLength;
+
+// Per Frame UBO
+layout(set = 6, binding = 0) uniform PerFrameUBO
+{
+    mat4  view_inverse;
+    mat4  proj_inverse;
+    mat4  view_proj_inverse;
+    mat4  prev_view_proj;
+    mat4  view_proj;
+    vec4  cam_pos;
+    vec4  current_prev_jitter;
+    Light light;
+}
+u_GlobalUBO;
+
+layout(set = 7, binding = 0, std430) buffer DenoiseTileData_t
+{
+    ivec2 coord[];
+}
+DenoiseTileData;
+layout(set = 7, binding = 1, std430) buffer DenoiseTileDispatchArgs_t
+{
+    uint num_groups_x;
+    uint num_groups_y;
+    uint num_groups_z;
+}
+DenoiseTileDispatchArgs;
+
+// ------------------------------------------------------------------
+// PUSH CONSTANTS ---------------------------------------------------
+// ------------------------------------------------------------------
+
+layout(push_constant) uniform PushConstants
+{
+    float alpha;
+    int   g_buffer_mip;
+}
+u_PushConstants;
+
+// ------------------------------------------------------------------
+// SHARED -----------------------------------------------------------
+// ------------------------------------------------------------------
+
+shared uint  g_ao_hit_masks[3][6];
+shared float g_mean_accumulation[8][24];
+shared uint  g_should_denoise;
+
+// ------------------------------------------------------------------
+// FUNCTIONS --------------------------------------------------------
+// ------------------------------------------------------------------
+
+void populate_cache()
+{
+    g_should_denoise = 0;
+
+    if (gl_LocalInvocationID.x < 3 && gl_LocalInvocationID.y < 6)
+    {
+        const ivec2 coord = ivec2(gl_WorkGroupID.x, gl_WorkGroupID.y * 2) - ivec2(1, 2) + ivec2(gl_LocalInvocationID.xy);
+
+        const ivec2 image_dim = textureSize(s_Input, 0);
+
+        if (any(lessThan(coord, ivec2(0, 0))) || any(greaterThan(coord, image_dim - ivec2(1, 1))))
+            g_ao_hit_masks[gl_LocalInvocationID.x][gl_LocalInvocationID.y] = 0xFFFFFFFF;
+        else
+            g_ao_hit_masks[gl_LocalInvocationID.x][gl_LocalInvocationID.y] = texelFetch(s_Input, coord, 0).x;
+    }
+
+    barrier();
+}
+
+// ------------------------------------------------------------------------
+
+float unpack_ao_hit_value(ivec2 coord)
+{
+    // Find the global coordinate for the top left corner of the current work group.
+    const ivec2 work_group_start_coord = ivec2(gl_WorkGroupID.xy) * ivec2(NUM_THREADS_X, NUM_THREADS_Y);
+
+    // Find the global coordinate for the top left corner of the cache.
+    const ivec2 cache_start_coord = work_group_start_coord - ivec2(RAY_MASK_SIZE_X, RAY_MASK_SIZE_Y * 2);
+
+    // Compute the local coordinate within the cache for the requested global coordinate.
+    const ivec2 unpacked_cache_coord = coord - cache_start_coord;
+
+    // From the unpacked local coordinate, compute which ray mask the requested hit belongs to.
+    // aka the packed local coordinate.
+    const ivec2 packed_cache_coord = unpacked_cache_coord / ivec2(RAY_MASK_SIZE_X, RAY_MASK_SIZE_Y);
+
+    // From the packed local coordinate, compute the unpacked local coordinate for the start of the current ray mask.
+    const ivec2 mask_start_coord = packed_cache_coord * ivec2(RAY_MASK_SIZE_X, RAY_MASK_SIZE_Y);
+
+    // Find the relative coordinate of the requested sample within the ray mask.
+    const ivec2 relative_mask_coord = unpacked_cache_coord - mask_start_coord;
+
+    // Compute the flattened hit index of the requested sample within the ray mask.
+    const int hit_index = relative_mask_coord.y * RAY_MASK_SIZE_X + relative_mask_coord.x;
+
+    // Use the hit index to bit shift the value from the cache and retrieve the requested sample.
+    return float((g_ao_hit_masks[packed_cache_coord.x][packed_cache_coord.y] >> hit_index) & 1u);
+}
+
+// ------------------------------------------------------------------
+
+float horizontal_neighborhood_mean(ivec2 coord)
+{
+    float result = 0.0f;
+
+    for (int x = -8; x <= 8; x++)
+        result += unpack_ao_hit_value(ivec2(coord.x + x, coord.y));
+
+    return result;
+}
+
+// ------------------------------------------------------------------
+
+float neighborhood_mean(ivec2 coord)
+{
+    float top    = horizontal_neighborhood_mean(ivec2(coord.x, coord.y - 8));
+    float middle = horizontal_neighborhood_mean(ivec2(coord.x, coord.y));
+    float bottom = horizontal_neighborhood_mean(ivec2(coord.x, coord.y + 8));
+
+    g_mean_accumulation[gl_LocalInvocationID.x][gl_LocalInvocationID.y]      = top;
+    g_mean_accumulation[gl_LocalInvocationID.x][gl_LocalInvocationID.y + 8]  = middle;
+    g_mean_accumulation[gl_LocalInvocationID.x][gl_LocalInvocationID.y + 16] = bottom;
+
+    barrier();
+
+    const int   radius = 8;
+    const float weight = (float(radius) * 2.0f + 1.0f) * (float(radius) * 2.0f + 1.0f);
+
+    float mean = 0.0f;
+
+    for (int y = 0; y <= 16; y++)
+        mean += g_mean_accumulation[gl_LocalInvocationID.x][gl_LocalInvocationID.y + y];
+
+    return mean / weight;
+}
+
+// ------------------------------------------------------------------
+// MAIN -------------------------------------------------------------
+// ------------------------------------------------------------------
+
+void main()
+{
+    const ivec2 size          = textureSize(s_PrevAO, 0);
+    const ivec2 current_coord = ivec2(gl_GlobalInvocationID.xy);
+
+    populate_cache();
+    float mean = neighborhood_mean(current_coord);
+
+    float depth = texelFetch(s_GBufferDepth, current_coord, u_PushConstants.g_buffer_mip).r;
+
+    float out_ao         = 1.0f;
+    float history_length = 0.0f;
+
+    if (depth != 1.0f)
+    {
+        float ao = unpack_ao_hit_value(current_coord);
+        float history_ao;
+        bool  success = reproject(current_coord,
+                                 depth,
+                                 u_PushConstants.g_buffer_mip,
+                                 u_GlobalUBO.view_proj_inverse,
+                                 s_GBuffer2,
+                                 s_GBuffer3,
+                                 s_PrevGBuffer2,
+                                 s_PrevGBuffer3,
+                                 s_PrevGBufferDepth,
+                                 s_PrevAO,
+                                 s_PrevHistoryLength,
+                                 history_ao,
+                                 history_length);
+
+        history_length = min(32.0, success ? history_length + 1.0f : 1.0f);
+
+        if (success)
+        {
+            float spatial_variance = mean;
+            spatial_variance       = max(spatial_variance - mean * mean, 0.0f);
+
+            // Compute the clamping bounding box
+            const float std_deviation = sqrt(spatial_variance);
+            const float nmin          = mean - 0.5f * std_deviation;
+            const float nmax          = mean + 0.5f * std_deviation;
+
+            history_ao = clamp(history_ao, nmin, nmax);
+        }
+
+        // this adjusts the alpha for the case where insufficient history is available.
+        // It boosts the temporal accumulation to give the samples equal weights in
+        // the beginning.
+        const float alpha = success ? max(u_PushConstants.alpha, 1.0 / history_length) : 1.0;
+
+        out_ao = mix(history_ao, ao, alpha);
+    }
+
+    // temporal integration
+    imageStore(i_Output, current_coord, vec4(out_ao));
+    imageStore(i_HistoryLength, current_coord, vec4(history_length));
+
+    // If at least one thread has an occlusion value, perform denoising.
+    if (out_ao < 1.0f)
+        g_should_denoise = 1;
+
+    barrier();
+
+    if (g_should_denoise == 1 && gl_LocalInvocationIndex == 0)
+    {
+        uint idx                   = atomicAdd(DenoiseTileDispatchArgs.num_groups_x, 1);
+        DenoiseTileData.coord[idx] = current_coord;
+    }
+}
+
+// ------------------------------------------------------------------

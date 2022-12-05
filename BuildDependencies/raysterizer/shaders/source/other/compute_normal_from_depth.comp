@@ -1,0 +1,135 @@
+#version 450
+
+#extension GL_GOOGLE_include_directive : require
+
+// ------------------------------------------------------------------
+// DEFINES ----------------------------------------------------------
+// ------------------------------------------------------------------
+
+#define NUM_THREADS_X 1
+#define NUM_THREADS_Y 1
+
+// ------------------------------------------------------------------
+// INPUTS -----------------------------------------------------------
+// ------------------------------------------------------------------
+
+layout(local_size_x = NUM_THREADS_X, local_size_y = NUM_THREADS_Y, local_size_z = 1) in;
+
+// ------------------------------------------------------------------
+// DESCRIPTOR SETS --------------------------------------------------
+// ------------------------------------------------------------------
+
+layout(set = 0, binding = 0) uniform image2D s_GBuffer2;
+
+// Current G-buffer DS
+layout(set = 2, binding = 0) uniform sampler2D s_GBufferDepth;
+
+// ------------------------------------------------------------------
+// PUSH CONSTANTS ---------------------------------------------------
+// ------------------------------------------------------------------
+
+layout(push_constant) uniform PushConstants
+{
+    mat4 inv_projection_matrix;
+    float far_plane;
+}
+u_PushConstants;
+
+float getRawDepth(vec2 uv)
+{
+    return textureLod(s_GBufferDepth, uv, 0.0);
+}
+
+float3 viewSpacePosAtScreenUV(vec2 uv)
+{
+    float3 viewSpaceRay = mul(PushConstants.inv_projection_matrix, float4(uv * 2.0 - 1.0, 1.0, 1.0) * PushConstants.far_plane);
+    float rawDepth = getRawDepth(uv);
+    return viewSpaceRay * Linear01Depth(rawDepth);
+}
+
+// ------------------------------------------------------------------
+// CONSTANTS --------------------------------------------------------
+// ------------------------------------------------------------------
+
+vec3 fetch_normal_from_depth(sampler2D depth_texture)
+{
+    const ivec2 size          = textureSize(depth_texture, 0);
+    const ivec2 current_coord = ivec2(gl_GlobalInvocationID.xy);
+    const vec2  pixel_center  = vec2(current_coord) + vec2(0.5);
+    const vec2  vpos     = pixel_center / vec2(size);
+
+    vec2 s_GBufferDepth_TexelSize = vec2(size);
+
+    // screen uv from vpos
+    vec2 uv = vpos * s_GBufferDepth_TexelSize.xy;
+
+    // current pixel's depth
+    float c = getRawDepth(uv);
+
+    // get current pixel's view space position
+    vec3 viewSpacePos_c = viewSpacePosAtScreenUV(uv);
+
+    // get view space position at 1 pixel offsets in each major direction
+    vec3 viewSpacePos_l = viewSpacePosAtScreenUV(uv + vec2(-1.0, 0.0) * s_GBufferDepth_TexelSize.xy);
+    vec3 viewSpacePos_r = viewSpacePosAtScreenUV(uv + vec2( 1.0, 0.0) * s_GBufferDepth_TexelSize.xy);
+    vec3 viewSpacePos_d = viewSpacePosAtScreenUV(uv + vec2( 0.0,-1.0) * s_GBufferDepth_TexelSize.xy);
+    vec3 viewSpacePos_u = viewSpacePosAtScreenUV(uv + vec2( 0.0, 1.0) * s_GBufferDepth_TexelSize.xy);
+
+    // get the difference between the current and each offset position
+    vec3 l = viewSpacePos_c - viewSpacePos_l;
+    vec3 r = viewSpacePos_r - viewSpacePos_c;
+    vec3 d = viewSpacePos_c - viewSpacePos_d;
+    vec3 u = viewSpacePos_u - viewSpacePos_c;
+
+    // get depth values at 1 & 2 pixels offsets from current along the horizontal axis
+    vec4 H = vec4(
+        getRawDepth(uv + vec2(-1.0, 0.0) * s_GBufferDepth_TexelSize.xy),
+        getRawDepth(uv + vec2( 1.0, 0.0) * s_GBufferDepth_TexelSize.xy),
+        getRawDepth(uv + vec2(-2.0, 0.0) * s_GBufferDepth_TexelSize.xy),
+        getRawDepth(uv + vec2( 2.0, 0.0) * s_GBufferDepth_TexelSize.xy)
+    );
+
+    // get depth values at 1 & 2 pixels offsets from current along the vertical axis
+    vec4 V = vec4(
+        getRawDepth(uv + vec2(0.0,-1.0) * s_GBufferDepth_TexelSize.xy),
+        getRawDepth(uv + vec2(0.0, 1.0) * s_GBufferDepth_TexelSize.xy),
+        getRawDepth(uv + vec2(0.0,-2.0) * s_GBufferDepth_TexelSize.xy),
+        getRawDepth(uv + vec2(0.0, 2.0) * s_GBufferDepth_TexelSize.xy)
+    );
+
+    // current pixel's depth difference from slope of offset depth samples
+    // differs from original article because we're using non-linear depth values
+    // see article's comments
+    vec2 he = abs((2 * H.xy - H.zw) - c);
+    vec2 ve = abs((2 * V.xy - V.zw) - c);
+
+    // pick horizontal and vertical diff with the smallest depth difference from slopes
+    vec3 hDeriv = he.x < he.y ? l : r;
+    vec3 vDeriv = ve.x < ve.y ? d : u;
+
+    // get view space normal from the cross product of the best derivatives
+    vec3 viewNormal = normalize(cross(hDeriv, vDeriv));
+
+    return viewNormal;
+}
+
+// A simple utility to convert a float to a 2-component octohedral representation
+vec2 direction_to_octohedral(vec3 normal)
+{
+    vec2 p = normal.xy * (1.0f / dot(abs(normal), vec3(1.0f)));
+    return normal.z > 0.0f ? p : (1.0f - abs(p.yx)) * (step(0.0f, p) * 2.0f - vec2(1.0f));
+}
+
+// ------------------------------------------------------------------
+// MAIN -------------------------------------------------------------
+// ------------------------------------------------------------------
+
+void main()
+{
+    vec3 normal = fetch_normal_from_depth(s_GBufferDepth);
+
+    // Store
+    imageStore(i_Output, current_coord, vec4(upsampled));
+}
+
+// ------------------------------------------------------------------

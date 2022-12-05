@@ -1,0 +1,183 @@
+#version 460
+
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+#define RAY_TRACING
+#include "raysterizer/shaders/source/other/common.glsl"
+#include "raysterizer/shaders/source/other/scene_descriptor_set.glsl"
+#include "raysterizer/shaders/source/other/bnd_sampler.glsl"
+#include "raysterizer/shaders/source/gi/gi_common.glsl"
+
+// ------------------------------------------------------------------------
+// DESCRIPTOR SETS --------------------------------------------------------
+// ------------------------------------------------------------------------
+
+layout(set = 1, binding = 0, rgba16f) uniform image2D i_Color;
+
+layout(set = 2, binding = 0) uniform PerFrameUBO
+{
+    mat4  view_inverse;
+    mat4  proj_inverse;
+    mat4  view_proj_inverse;
+    mat4  prev_view_proj;
+    mat4  view_proj;
+    vec4  cam_pos;
+    vec4  near_far;
+    vec4  current_prev_jitter;
+    Light light;
+}
+u_GlobalUBO;
+
+layout(set = 2, binding = 1) uniform sampler2D s_BlueNoise1;
+
+layout(set = 3, binding = 0) uniform sampler2D s_GBuffer1; // RGB: Albedo, A: Roughness
+layout(set = 3, binding = 1) uniform sampler2D s_GBuffer2; // RGB: Normal, A: Metallic
+layout(set = 3, binding = 2) uniform sampler2D s_GBuffer3; // RG: Motion Vector, BA: -
+layout(set = 3, binding = 3) uniform sampler2D s_GBufferDepth;
+
+layout(set = 5, binding = 0) uniform sampler2D s_SobolSequence;
+layout(set = 5, binding = 1) uniform sampler2D s_ScramblingRankingTile;
+
+layout(set = 6, binding = 0) uniform sampler2D s_Irradiance;
+layout(set = 6, binding = 1) uniform sampler2D s_Depth;
+layout(set = 6, binding = 2, scalar) uniform DDGIUBO
+{
+    DDGIUniforms ddgi;
+};
+
+// ------------------------------------------------------------------------
+// PUSH CONSTANTS ---------------------------------------------------------
+// ------------------------------------------------------------------------
+
+layout(push_constant) uniform PushConstants
+{
+    float bias;
+    float trim;
+    uint  num_frames;
+    int   g_buffer_mip;
+    int   sample_gi;
+    int   approximate_with_ddgi;
+    float gi_intensity;
+    float rough_ddgi_intensity;
+    float ibl_indirect_specular_intensity;
+}
+u_PushConstants;
+
+// ------------------------------------------------------------------------
+// PAYLOADS ---------------------------------------------------------------
+// ------------------------------------------------------------------------
+
+layout(location = 0) rayPayloadEXT ReflectionPayload p_Payload;
+
+// ------------------------------------------------------------------------
+// FUNCTIONS --------------------------------------------------------------
+// ------------------------------------------------------------------------
+
+vec4 importance_sample_ggx(vec2 E, vec3 N, float Roughness)
+{
+    float a  = Roughness * Roughness;
+    float m2 = a * a;
+
+    float phi      = 2.0f * M_PI * E.x;
+    float cosTheta = sqrt((1.0f - E.y) / (1.0f + (m2 - 1.0f) * E.y));
+    float sinTheta = sqrt(1.0f - cosTheta * cosTheta);
+
+    // from spherical coordinates to cartesian coordinates - halfway vector
+    vec3 H;
+    H.x = cos(phi) * sinTheta;
+    H.y = sin(phi) * sinTheta;
+    H.z = cosTheta;
+
+    float d = (cosTheta * m2 - cosTheta) * cosTheta + 1;
+    float D = m2 / (M_PI * d * d);
+
+    float PDF = D * cosTheta;
+
+    // from tangent-space H vector to world-space sample vector
+    vec3 up        = abs(N.z) < 0.999f ? vec3(0.0f, 0.0f, 1.0f) : vec3(1.0f, 0.0f, 0.0f);
+    vec3 tangent   = normalize(cross(up, N));
+    vec3 bitangent = cross(N, tangent);
+
+    vec3 sampleVec = tangent * H.x + bitangent * H.y + N * H.z;
+    return vec4(normalize(sampleVec), PDF);
+}
+
+// ------------------------------------------------------------------------
+
+vec2 next_sample(ivec2 coord)
+{
+    return vec2(sample_blue_noise(coord, int(u_PushConstants.num_frames), 0, s_SobolSequence, s_ScramblingRankingTile),
+                sample_blue_noise(coord, int(u_PushConstants.num_frames), 1, s_SobolSequence, s_ScramblingRankingTile));
+}
+
+// ------------------------------------------------------------------------
+// MAIN -------------------------------------------------------------------
+// ------------------------------------------------------------------------
+
+void main()
+{
+    const ivec2 size          = textureSize(s_GBuffer1, u_PushConstants.g_buffer_mip);
+    const ivec2 current_coord = ivec2(gl_LaunchIDEXT.xy);
+    const vec2  pixel_center  = vec2(current_coord) + vec2(0.5);
+    const vec2  tex_coord     = pixel_center / vec2(size);
+
+    float depth = texelFetch(s_GBufferDepth, current_coord, u_PushConstants.g_buffer_mip).r;
+
+    if (depth == 1.0f)
+    {
+        imageStore(i_Color, current_coord, vec4(0.0f, 0.0f, 0.0f, -1.0f));
+        return;
+    }
+
+    float roughness = texelFetch(s_GBuffer3, current_coord, u_PushConstants.g_buffer_mip).b;
+    vec3  P         = world_position_from_depth(tex_coord, depth, u_GlobalUBO.view_proj_inverse);
+    vec3  N         = octohedral_to_direction(texelFetch(s_GBuffer2, current_coord, u_PushConstants.g_buffer_mip).rg);
+    vec3  Wo        = normalize(u_GlobalUBO.cam_pos.xyz - P.xyz);
+
+    vec4 origin = u_GlobalUBO.view_proj_inverse * vec4(0.0, 0.0, u_GlobalUBO.near_far.x, 1);
+    vec4 target = u_GlobalUBO.view_proj_inverse * vec4(tex_coord.x, tex_coord.y, u_GlobalUBO.near_far.y, 1);
+    origin.xyz /= origin.w;
+    origin.w = 1.0f / origin.w;
+    target.xyz /= target.w;
+    target.w = 1.0f / target.w;
+    vec4 direction = normalize(target - origin);
+    Wo = direction.xyz;
+
+    uint  ray_flags  = gl_RayFlagsOpaqueEXT;
+    uint  cull_mask  = 0xff;
+    float tmin       = 0.001;
+    float tmax       = 10000.0;
+    vec3  ray_origin = P + N * u_PushConstants.bias;
+
+    p_Payload.ray_length = -1.0f;
+
+    if (roughness < MIRROR_REFLECTIONS_ROUGHNESS_THRESHOLD)
+    {
+        vec3 R = reflect(-Wo, N.xyz);
+        traceRayEXT(u_TopLevelAS, ray_flags, cull_mask, 0, 0, 0, ray_origin, tmin, R, tmax, 0);
+    }
+    else if (roughness > DDGI_REFLECTIONS_ROUGHNESS_THRESHOLD && u_PushConstants.approximate_with_ddgi == 1)
+    {
+        vec3 R          = reflect(-Wo, N.xyz);
+        p_Payload.color = u_PushConstants.rough_ddgi_intensity * sample_irradiance(ddgi, P, R, Wo, s_Irradiance, s_Depth);
+    }
+    else
+    {
+        vec2 Xi = next_sample(current_coord) * u_PushConstants.trim;
+
+        vec4 Wh_pdf = importance_sample_ggx(Xi, N, roughness);
+
+        float pdf = Wh_pdf.w;
+        vec3  Wi  = reflect(-Wo, Wh_pdf.xyz);
+        traceRayEXT(u_TopLevelAS, ray_flags, cull_mask, 0, 0, 0, ray_origin, tmin, Wi, tmax, 0);
+    }
+
+    vec3 clamped_color = min(p_Payload.color, vec3(0.7f));
+
+    imageStore(i_Color, current_coord, vec4(clamped_color, p_Payload.ray_length));
+}
+
+// ------------------------------------------------------------------------

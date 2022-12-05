@@ -1,0 +1,7 @@
+#version 450
+
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_GOOGLE_include_directive : require
+
+#include "raysterizer/shaders/source/gi/gi_common.glsl"
+#include "raysterizer/shaders/source/gi/gi_probe_update.glsl"

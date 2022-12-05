@@ -1,0 +1,113 @@
+{
+    "cache": {
+        "context_release_entries_past_frame_counter_difference": 128,
+        "disk": {
+            "enable": true
+        },
+        "fossilize": {
+            "enable": false,
+            "path": "raysterizer/db.foz"
+        },
+        "render_frame_release_entries_past_frame_counter_difference": 128
+    },
+    "descriptor_pool_size_multipler": 2,
+    "glfw": {
+        "poll_events": false
+    },
+    "height": 720,
+    "profiler": {
+        "enable": false
+    },
+    "raysterizer": {
+        "buffer_upgrade_usage_counter": 16,
+        "draw_call": {
+            "binding_index_pool_interval": 1000,
+            "combined_sampler_binding_index_pool_starting_index": 2000,
+            "set": 1,
+            "storage_buffer_binding_index_pool_starting_index": 0,
+            "uniform_buffer_binding_index_pool_starting_index": 1000
+        },
+        "global_render_pass_color_load_op_clear": true,
+        "global_render_pass_create_depth_buffer": false,
+        "materials": {
+            "default_color": [
+                1.0,
+                0.0,
+                0.0,
+                1.0
+            ],
+            "path": "raysterizer/materials/materials.json"
+        },
+        "mvp_analysis": {
+            "run_async": false
+        },
+        "opengl": {
+            "ignored_extensions": [
+                "GL_ARB_half_float_vertex",
+                "GL_ARB_texture_multisample",
+                "GL_ARB_texture_storage",
+                "GL_ARB_pixel_buffer_object",
+                "GL_ARB_copy_image",
+                "GL_ARB_timer_query",
+                "GL_ARB_vertex_attrib_binding",
+                "GL_ARB_vertex_type_2_10_10_10_rev",
+                "GL_EXT_disjoint_timer_query",
+                "GL_EXT_texture_anisotropy",
+                "GL_EXT_texture_anisotropy",
+                "GL_EXT_disjoint_timer_query"
+            ],
+            "render": true,
+            "version": "4.6.0"
+        },
+        "pipeline_release_entries_past_frame_counter_difference": 16,
+        "resource_manager": {
+            "deallocate_frame_counter": 0
+        },
+        "vulkan": {
+            "max_variable_bindings": 2048,
+            "recursion_depth": 8
+        },
+        "wait_idle": false
+    },
+    "shader": {
+        "cache_with_opengl_source": false,
+        "compiler": {
+            "cache_path": "raysterizer/shaders/cache",
+            "failure": {
+                "dump_shader_path": "raysterizer/debug.glsl",
+                "enable": true
+            },
+            "optimization": "none",
+            "search_paths": [
+                ".",
+                "raysterizer/shaders/source",
+                "raysterizer/shaders/cache"
+            ]
+        },
+        "converter": {
+            "color_search": "",
+            "coord_tex_search": "tex",
+            "normal_search": "nor",
+            "position_search": "pos"
+        },
+        "dump_all_shaders": {
+            "dump_shader_path": "raysterizer/shaders/dumps",
+            "enable": true
+        },
+        "dump_all_textures": {
+            "enable": false,
+            "path": "raysterizer/textures/dumps"
+        }
+    },
+    "validation_callback": false,
+    "validation_layers": true,
+    "vsync": false,
+    "vulkan": {
+        "render_frame": {}
+    },
+    "game": {
+        "dolphin": "none"
+    },
+    "width": 1280,
+    "window_name": "Raysterizer"
+}

@@ -1,0 +1,184 @@
+#version 460
+
+//"C:\Users\henry\AppData\Local\Roblox\Versions\version-0a4cf97c7c1047a1\RobloxStudioBeta.exe"  -startEvent www.roblox.com/robloxQTStudioStartedEvent 
+//RobloxStudioBeta.exe -startEvent www.roblox.com/robloxQTStudioStartedEvent
+
+#extension GL_ARB_gpu_shader_int64 : require
+#extension GL_ARB_shader_clock : require
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_GOOGLE_include_directive : enable
+
+#define RAYGEN_PAYLOAD
+#include "common.h"
+
+const vec2 vAAOffsets[9][8] = {
+    { vec2(0.00, 0.00), vec2(0.00, 0.00), vec2(0.00, 0.00), vec2(0.00, 0.00),
+      vec2(0.00, 0.00), vec2(0.00, 0.00), vec2(0.00, 0.00), vec2(0.00, 0.00),
+    },
+    { vec2(0.00, 0.00), vec2(0.00, 0.00), vec2(0.00, 0.00), vec2(0.00, 0.00),
+      vec2(0.00, 0.00), vec2(0.00, 0.00), vec2(0.00, 0.00), vec2(0.00, 0.00),
+    },
+    { vec2(0.25, 0.25), vec2(-0.25, -0.25), vec2(0.00, 0.00), vec2(0.00, 0.00),
+      vec2(0.00, 0.00), vec2(0.00, 0.00), vec2(0.00, 0.00), vec2(0.00, 0.00),
+    },
+    { vec2(-0.125, -0.375), vec2(0.375, -0.125), vec2(-0.375, 0.125), vec2(0.125, 0.375),
+      vec2(0.00, 0.00), vec2(0.00, 0.00), vec2(0.00, 0.00), vec2(0.00, 0.00),
+    },
+    { vec2(-0.125, -0.375), vec2(0.375, -0.125), vec2(-0.375, 0.125), vec2(0.125, 0.375),
+      vec2(0.00, 0.00), vec2(0.00, 0.00), vec2(0.00, 0.00), vec2(0.00, 0.00),
+    },
+    { vec2(0.0625, -0.1875), vec2(-0.0625, 0.1875), vec2(0.3125, 0.0625), vec2(-0.1875, -0.3125),
+      vec2(-0.3125, 0.3125), vec2(-0.4375, -0.0625), vec2(0.1875, 0.4375), vec2(0.4375, -0.4375),
+    },
+    { vec2(0.0625, -0.1875), vec2(-0.0625, 0.1875), vec2(0.3125, 0.0625), vec2(-0.1875, -0.3125),
+      vec2(-0.3125, 0.3125), vec2(-0.4375, -0.0625), vec2(0.1875, 0.4375), vec2(0.4375, -0.4375),
+    },
+    { vec2(0.0625, -0.1875), vec2(-0.0625, 0.1875), vec2(0.3125, 0.0625), vec2(-0.1875, -0.3125),
+      vec2(-0.3125, 0.3125), vec2(-0.4375, -0.0625), vec2(0.1875, 0.4375), vec2(0.4375, -0.4375),
+    },
+    { vec2(0.0625, -0.1875), vec2(-0.0625, 0.1875), vec2(0.3125, 0.0625), vec2(-0.1875, -0.3125),
+      vec2(-0.3125, 0.3125), vec2(-0.4375, -0.0625), vec2(0.1875, 0.4375), vec2(0.4375, -0.4375),
+    },
+};
+
+int num_samples = 4;
+
+void main()
+{
+	//const uint64_t clock = Camera.ShowHeatmap ? clockARB() : 0;
+
+    const ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
+    const ivec2 resolution = ivec2(gl_LaunchSizeEXT.xy);
+
+	
+	uint random_seed = 10;
+	float pixel_seed = RandomFloat(random_seed);
+	uint ray_seed = InitRandomSeed(InitRandomSeed(pixel.x, pixel.y), num_samples);
+
+	payload.seed = ray_seed;
+
+	vec3 color = vec3(0.0f);
+    vec3 normal = vec3(0);
+    vec4 rough_value = vec4(0);
+    float reflect_contrib = 0;
+    float depth = 0;
+
+    for (int i = 0; i < num_samples; ++i)
+	{
+		const vec2 pixel_center = pixel + vec2(0.5) + vAAOffsets[min(num_samples, 8)][i % 8];
+		const vec2 inUV = pixel_center / resolution;
+		vec2 d = inUV * 2.0 - 1.0;
+		d.y = -d.y;
+
+		//https://stackoverflow.com/questions/53467077/opengl-ray-tracing-using-inverse-transformations
+		mat4 inv_proj_view = inverse(rayterizer_info.projection_view);
+		//vec4 origin = inv_proj_view * vec4(d.x, d.y, 0, 1);
+		vec4 origin = inv_proj_view * vec4(0.0, 0.0, rayterizer_info.z_near, 1);
+		//vec4 origin = inv_proj_view * vec4(d.x, d.y, rayterizer_info.z_near, 1);
+		vec4 target = inv_proj_view * vec4(d.x, d.y, rayterizer_info.z_far, 1);
+		origin.xyz /= origin.w;
+		origin.w = 1.0f / origin.w;
+		target.xyz /= target.w;
+		target.w = 1.0f / target.w;
+		vec3 direction = normalize(target - origin).xyz;
+
+		/*
+		const float near = rayterizer_info.z_near;
+		const float far = rayterizer_info.z_far;
+		origin = (inv_proj_view * vec4(d, -1.0, 1.0) * near);
+		direction = normalize((inv_proj_view * vec4(d * (far - near), far + near, far - near)).xyz);
+		*/
+
+		/*
+		vec4 origin = vec4(0.0, 0.0, rayterizer_info.z_near, 0.0);
+		vec4 target = vec4(d.x, -d.y, rayterizer_info.z_far, 1.0);
+		vec4 direction = normalize(target - origin);
+		*/
+
+		/*
+		vec4 origin = vec4(d.x, -d.y, rayterizer_info.z_near, 1.0);
+		vec4 target = vec4(d.x, -d.y, rayterizer_info.z_far, 1.0);
+
+		vec4 direction = normalize(target - origin);
+		*/
+
+		payload.ray_origin = origin.xyz;
+		payload.ray_direction = direction.xyz;
+		payload.direct_color = vec3(0.0);
+		payload.indirect_color = vec3(0.0);
+		payload.ray_depth = 0;
+		payload.ray_active = true;
+		payload.previous_normal = vec3(0.0);
+		
+		payload.reflect_contribution = 0.0;
+		payload.normal = vec3(0.0);
+		payload.rough_value = vec4(0.0);
+		payload.depth = 0.0;
+		payload.ior = 0.0;
+		payload.ray_type = RT_GENERIC;
+
+		//uint ray_flags = gl_RayFlagsNoneEXT;
+		//uint ray_flags = gl_RayFlagsSkipClosestHitShaderEXT;
+		uint ray_flags = gl_RayFlagsOpaqueEXT;
+		uint cull_mask = 0xFF;
+		uint sbt_record_offset = 0;
+		uint sbt_record_stride = 0;
+		uint miss_index = 0;
+		float tmin = 0.001;
+		float tmax = 10000.0;
+		const int payload_location = MAIN_PAYLOAD;
+
+		traceRayEXT(tlas,
+					ray_flags,
+					cull_mask,
+					sbt_record_offset,
+					sbt_record_stride,
+					miss_index, 
+					payload.ray_origin, 
+					tmin, 
+					payload.ray_direction,
+					tmax, 
+					payload_location);
+
+        color += payload.direct_color;
+        normal += payload.normal;
+        // if(i>0) payload.roughValue.a = min(prevRough, payload.roughValue.a);
+        rough_value += payload.rough_value;
+        reflect_contrib += payload.reflect_contribution;
+        depth += payload.depth;
+	}
+
+	vec4 color_ = vec4(color, reflect_contrib);// / float(num_samples);
+	vec4 normal_ = vec4(normal, log(depth) * 0.25);
+	vec4 rough_value_ = rough_value / float(num_samples);
+
+	/*
+    vec4 ru = imageLoad(roughImage, pos + ivec2(0, 1));
+    vec4 rd = imageLoad(roughImage, pos - ivec2(0, 1));
+    vec4 rl = imageLoad(roughImage, pos + ivec2(1, 0));
+    vec4 rr = imageLoad(roughImage, pos - ivec2(1, 0));
+
+    vec4 n = imageLoad(normalImage, pos);
+    vec4 nu = imageLoad(normalImage, pos + ivec2(0, 1));
+    vec4 nd = imageLoad(normalImage, pos - ivec2(0, 1));
+    vec4 nl = imageLoad(normalImage, pos + ivec2(1, 0));
+    vec4 nr = imageLoad(normalImage, pos - ivec2(1, 0));
+
+    float uf = min(ru.a, rough.a) * clamp((1.f - distance(nu, n) * 10), 0, 1);
+    float df = min(rd.a, rough.a) * clamp((1.f - distance(nd, n) * 10), 0, 1);
+    float lf = min(rl.a, rough.a) * clamp((1.f - distance(nl, n) * 10), 0, 1);
+    float rf = min(rr.a, rough.a) * clamp((1.f - distance(nr, n) * 10), 0, 1);
+    vec4 trans = vec4(min(min(min(uf, df), lf), rf));
+	*/
+
+    vec3 col = clamp(mix(color_.rgb, rough_value_.rgb, color_.a), 0, 1);
+    float luma = dot(col.rgb, vec3(0.299, 0.587, 0.114)); // for FXAA
+
+	vec4 fade_color = vec4(0.0, 0.0, 0.0, 0.0);
+    // fade postprocessing
+    col = mix(col, fade_color.rgb, fade_color.a);
+	imageStore(image, pixel, vec4(col, luma));
+
+	//imageStore(image, pixel, vec4(color, 1.0));
+}

@@ -1,0 +1,141 @@
+#version 450
+
+#extension GL_GOOGLE_include_directive : require
+
+#include "raysterizer/shaders/source/other/common.glsl"
+#define USE_EDGE_STOPPING_NORMAL_WEIGHT
+#include "raysterizer/shaders/source/other/edge_stopping.glsl"
+
+// ------------------------------------------------------------------
+// DEFINES ----------------------------------------------------------
+// ------------------------------------------------------------------
+
+#define NUM_THREADS_X 8
+#define NUM_THREADS_Y 8
+#define CACHE_SIZE_X NUM_THREADS_X * 2
+#define CACHE_SIZE_Y NUM_THREADS_Y * 2
+#define GAUSS_BLUR_DEVIATION 1.5
+#define USE_NORMAL_EDGE_STOPPING
+
+// ------------------------------------------------------------------
+// INPUTS -----------------------------------------------------------
+// ------------------------------------------------------------------
+
+layout(local_size_x = NUM_THREADS_X, local_size_y = NUM_THREADS_Y, local_size_z = 1) in;
+
+// ------------------------------------------------------------------
+// DESCRIPTOR SETS --------------------------------------------------
+// ------------------------------------------------------------------
+
+layout(set = 0, binding = 0, r16f) uniform image2D i_Output;
+
+layout(set = 1, binding = 0) uniform sampler2D s_Input;
+
+layout(set = 2, binding = 1) uniform sampler2D s_HistoryLength;
+
+// Current G-buffer DS
+layout(set = 3, binding = 0) uniform sampler2D s_GBuffer1; // RGB: Albedo, A: Metallic
+layout(set = 3, binding = 1) uniform sampler2D s_GBuffer2; // RG: Normal, BA: Motion Vector
+layout(set = 3, binding = 2) uniform sampler2D s_GBuffer3; // R: Roughness, G: Curvature, B: Mesh ID, A: Linear Z
+layout(set = 3, binding = 3) uniform sampler2D s_GBufferDepth;
+
+layout(set = 4, binding = 0, std430) buffer DenoiseTileData_t
+{
+    ivec2 coord[];
+}
+DenoiseTileData;
+
+// ------------------------------------------------------------------------
+// PUSH CONSTANTS ---------------------------------------------------------
+// ------------------------------------------------------------------------
+
+layout(push_constant) uniform PushConstants
+{
+    vec4  z_buffer_params;
+    ivec2 direction;
+    int   radius;
+    int   g_buffer_mip;
+}
+u_PushConstants;
+
+// ------------------------------------------------------------------
+// SHARED MEMORY ----------------------------------------------------
+// ------------------------------------------------------------------
+
+#if defined(USE_SHARED_MEMORY_CACHE)
+shared float g_cached_depth[CACHE_SIZE_X][CACHE_SIZE_Y];
+shared uint  g_cached_normal_xy[CACHE_SIZE_X][CACHE_SIZE_Y];
+shared uint  g_cached_normal_z_ao[CACHE_SIZE_X][CACHE_SIZE_Y];
+#endif
+
+// ------------------------------------------------------------------
+// FUNCTIONS --------------------------------------------------------
+// ------------------------------------------------------------------
+
+float bilateral_blur(ivec2 current_coord)
+{
+    const float deviation = float(u_PushConstants.radius) / GAUSS_BLUR_DEVIATION;
+
+    float total_ao     = texelFetch(s_Input, current_coord, 0).r;
+    float total_weight = 1.0f;
+
+    float center_depth  = linear_eye_depth(texelFetch(s_GBufferDepth, current_coord, u_PushConstants.g_buffer_mip).r, u_PushConstants.z_buffer_params);
+    vec3  center_normal = octohedral_to_direction(texelFetch(s_GBuffer2, current_coord, u_PushConstants.g_buffer_mip).rg);
+
+    int radius = u_PushConstants.radius;
+
+    for (int i = -radius; i <= radius; i++)
+    {
+        if (i == 0)
+            continue;
+
+        ivec2 sample_coord  = current_coord + u_PushConstants.direction * ivec2(i);
+        float sample_depth  = linear_eye_depth(texelFetch(s_GBufferDepth, sample_coord, u_PushConstants.g_buffer_mip).r, u_PushConstants.z_buffer_params);
+        float sample_ao     = texelFetch(s_Input, sample_coord, 0).r;
+        vec3  sample_normal = octohedral_to_direction(texelFetch(s_GBuffer2, sample_coord, u_PushConstants.g_buffer_mip).rg);
+
+        float weight = gaussian_weight(float(i), deviation);
+
+        weight *= compute_edge_stopping_weight(center_depth,
+                                               sample_depth,
+                                               1.0f,
+                                               center_normal,
+                                               sample_normal,
+                                               32.0f);
+
+        total_ao += weight * sample_ao;
+        total_weight += weight;
+    }
+
+    return total_ao / max(total_weight, 0.0001f);
+}
+
+// ------------------------------------------------------------------
+// MAIN -------------------------------------------------------------
+// ------------------------------------------------------------------
+
+void main()
+{
+    // Query the G-Buffer image size
+    ivec2 size = textureSize(s_GBuffer1, u_PushConstants.g_buffer_mip);
+
+    // Compute current pixel coord
+    ivec2 current_coord = DenoiseTileData.coord[gl_WorkGroupID.x] + ivec2(gl_LocalInvocationID.xy);
+
+    // Skip pixel if it belongs to the background
+    float depth = texelFetch(s_GBufferDepth, current_coord, u_PushConstants.g_buffer_mip).r;
+
+    if (depth == 1.0f)
+    {
+        imageStore(i_Output, current_coord, vec4(1.0f));
+        return;
+    }
+
+    // Blur
+    float ao = bilateral_blur(current_coord);
+
+    // Store blurred ao
+    imageStore(i_Output, current_coord, vec4(ao));
+}
+
+// ------------------------------------------------------------------

@@ -1,0 +1,136 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_ray_tracing : enable
+#extension GL_EXT_ray_query : enable
+#extension GL_EXT_nonuniform_qualifier : require
+
+#define RAY_TRACING
+#define RAY_TRACING_QUERY
+#include "raysterizer/shaders/source/other/common.glsl"
+#include "raysterizer/shaders/source/other/scene_descriptor_set.glsl"
+#include "raysterizer/shaders/source/other/ray_query.glsl"
+#include "raysterizer/shaders/source/other/bnd_sampler.glsl"
+#define SOFT_SHADOWS
+#define SHADOW_RAY_ONLY
+#include "raysterizer/shaders/source/other/lighting.glsl"
+
+// ------------------------------------------------------------------
+// DEFINES ----------------------------------------------------------
+// ------------------------------------------------------------------
+
+#define NUM_THREADS_X 8
+#define NUM_THREADS_Y 4
+
+// ------------------------------------------------------------------
+// INPUTS -----------------------------------------------------------
+// ------------------------------------------------------------------
+
+layout(local_size_x = NUM_THREADS_X, local_size_y = NUM_THREADS_Y, local_size_z = 1) in;
+
+// ------------------------------------------------------------------
+// DESCRIPTOR SETS --------------------------------------------------
+// ------------------------------------------------------------------
+
+layout(set = 1, binding = 0, r32ui) uniform uimage2D i_Output;
+
+layout(set = 2, binding = 0) uniform PerFrameUBO
+{
+    mat4  view_inverse;
+    mat4  proj_inverse;
+    mat4  view_proj_inverse;
+    mat4  prev_view_proj;
+    mat4  view_proj;
+    vec4  cam_pos;
+    vec4  near_far;
+    vec4  current_prev_jitter;
+    Light light;
+}
+u_GlobalUBO;
+
+layout(set = 3, binding = 0) uniform sampler2D s_GBuffer1; // RGB: Albedo, A: Metallic
+layout(set = 3, binding = 1) uniform sampler2D s_GBuffer2; // RG: Normal, BA: Motion Vector
+layout(set = 3, binding = 2) uniform sampler2D s_GBuffer3; // R: Roughness, G: Curvature, B: Mesh ID, A: Linear Z
+layout(set = 3, binding = 3) uniform sampler2D s_GBufferDepth;
+
+layout(set = 4, binding = 0) uniform sampler2D s_SobolSequence;
+layout(set = 4, binding = 1) uniform sampler2D s_ScramblingRankingTile;
+
+// ------------------------------------------------------------------------
+// PUSH CONSTANTS ---------------------------------------------------------
+// ------------------------------------------------------------------------
+
+layout(push_constant) uniform PushConstants
+{
+    float bias;
+    uint  num_frames;
+    int   g_buffer_mip;
+}
+u_PushConstants;
+
+// ------------------------------------------------------------------
+// FUNCTIONS --------------------------------------------------------
+// ------------------------------------------------------------------
+
+vec2 next_sample(ivec2 coord)
+{
+    return vec2(sample_blue_noise(coord, int(u_PushConstants.num_frames), 0, s_SobolSequence, s_ScramblingRankingTile),
+                sample_blue_noise(coord, int(u_PushConstants.num_frames), 1, s_SobolSequence, s_ScramblingRankingTile));
+}
+
+// ------------------------------------------------------------------
+// SHARED -----------------------------------------------------------
+// ------------------------------------------------------------------
+
+shared uint g_visibility;
+
+// ------------------------------------------------------------------
+// MAIN -------------------------------------------------------------
+// ------------------------------------------------------------------
+
+void main()
+{
+    if (gl_LocalInvocationIndex == 0)
+        g_visibility = 0;
+
+    barrier();
+
+    const ivec2 size          = textureSize(s_GBuffer1, u_PushConstants.g_buffer_mip);
+    const ivec2 current_coord = ivec2(gl_GlobalInvocationID.xy);
+    const vec2  pixel_center  = vec2(current_coord) + vec2(0.5);
+    const vec2  tex_coord     = pixel_center / vec2(size);
+
+    float depth = texelFetch(s_GBufferDepth, current_coord, u_PushConstants.g_buffer_mip).r;
+
+    uint result = 0;
+
+    if (depth != 1.0f)
+    {
+        vec3 world_pos  = world_position_from_depth(tex_coord, depth, u_GlobalUBO.view_proj_inverse);
+        vec3 normal     = octohedral_to_direction(texelFetch(s_GBuffer2, current_coord, u_PushConstants.g_buffer_mip).rg);
+        vec3 ray_origin = world_pos + normal * u_PushConstants.bias;
+
+        // Fetch a blue noise value for this frame.
+        vec2 rnd_sample = next_sample(current_coord);
+
+        // Fetch the jittered shadow ray direction, ray length and attenuation value.
+        vec3  Wi;
+        float t_max;
+        float attenuation;
+
+        fetch_light_properties(u_GlobalUBO.light, world_pos, normal, rnd_sample, Wi, t_max, attenuation);
+
+        // Only fire a shadow ray if the attenuation is above zero.
+        if (attenuation > 0.0f)
+            result = uint(query_distance(ray_origin, Wi, t_max));
+    }
+
+    atomicOr(g_visibility, result << gl_LocalInvocationIndex);
+
+    barrier();
+
+    if (gl_LocalInvocationIndex == 0)
+        imageStore(i_Output, ivec2(gl_WorkGroupID.xy), uvec4(g_visibility));
+}
+
+// ------------------------------------------------------------------
