@@ -1,6 +1,6 @@
 # Raysterizer
 
-![](images/dolphin.gif)
+<img src="images/dolphin.gif" width="100%" height="100%"/>
 
 Framework that transforms existing opengl programs instead use raytracing.
 
