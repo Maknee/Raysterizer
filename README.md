@@ -1,4 +1,7 @@
 # Raysterizer
+
+![](images/dolphin.gif)
+
 Framework that transforms existing opengl programs instead use raytracing.
 
 - This project is very much in a work-in progress, expect many bugs and crashes
@@ -19,17 +22,17 @@ Framework that transforms existing opengl programs instead use raytracing.
 
 Use the correct configuration per example below
 
-### LearnOpenGL (tutorials)
+### LearnOpenGL (tutorials from https://learnopengl.com/)
 
 Download the [latest release](https://github.com/Maknee/Raysterizer/releases/)
 
-Change `learn_opengl.config` to `raysterizer_config.json`
+Download `learnopengl.zip` from [releases](https://github.com/Maknee/Raysterizer/releases/)
 
 ### Craft (Minecraft clone)
 
 [Download craft](https://github.com/fogleman/Craft) and compile it following the instructions on the github
 
-Download the [latest release](https://github.com/Maknee/Raysterizer/releases/) and extract to the `craft` directory
+Download `runelite.zip` from [releases](https://github.com/Maknee/Raysterizer/releases/)
 
 ### Runescape
 
@@ -45,7 +48,7 @@ Run `update.cmd` to copy the update files to runelite
 
 Compile and run runelite
 
-Enable GPU plugin from settings
+Enable GPU plugin from runelite settings
 
 ### Dolphin
 
@@ -81,6 +84,8 @@ cd build
 cmake ..
 msbuild.exe Raysterizer.sln /p:Configuration=Release
 or open Raysterizer.sln with Visual Studio and build Raysterizer
+
+Then copy the contents of BuildDependencies/ to the build/bin/ directory
 ```
 
 ## Configuration
