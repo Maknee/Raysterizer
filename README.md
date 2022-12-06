@@ -12,7 +12,7 @@ Framework that transforms existing opengl programs instead use raytracing.
 
 ## Explanation
 
-[Blog](https://maknee.github.io/blog/2022/Raysterizer/#vulkan-ray-tracing)
+[Blog](https://maknee.github.io/blog/2022/Raysterizer/)
 
 ## Supported Platforms
 
